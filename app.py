@@ -1,16 +1,15 @@
 import streamlit as st
 import base64
 import os
-from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # 1. Page Configuration
-st.set_page_config(page_title="LangChain Multi-Agent Stories", layout="wide", page_icon="🦜")
-st.title("🦜 LangChain Multi-Agent User Story Pipeline")
-st.caption("Orchestrating specialized agents via LangChain, utilizing external skill configuration files.")
+st.set_page_config(page_title="Enterprise Agile Agent", layout="wide", page_icon="⚙️")
+st.title("⚙️ Enterprise Agile Requirement Engine")
+st.caption("A multi-agent LangChain workspace supporting Greenfield creation and multi-modal change diffing.")
 
-# Helper to securely read skill markdown files
+# Helper to read skill markdown files
 def load_skill_file(filename):
     if os.path.exists(filename):
         with open(filename, "r", encoding="utf-8") as f:
@@ -19,126 +18,167 @@ def load_skill_file(filename):
         st.error(f"Missing skill configuration file: `{filename}`")
         return ""
 
-# Helper to encode file strings for LangChain Vision payloads
+# Helper to encode images
 def encode_image(uploaded_file):
     return base64.b64encode(uploaded_file.read()).decode('utf-8')
 
-# Initialize standard state mechanisms
+# Initialize session states
 if "agent_1_output" not in st.session_state: st.session_state.agent_1_output = ""
 if "agent_2_output" not in st.session_state: st.session_state.agent_2_output = ""
 if "agent_3_output" not in st.session_state: st.session_state.agent_3_output = ""
 
-# Set explicit hardcoded API key for prototyping
-api_key_input = "YOUR_OPENAI_API_KEY"  # Replace with your actual OpenAI API key
+# Set explicit OpenAI API key for prototyping
+api_key_input = "your-actual-openai-api-key-here"
 
-# 2. Sidebar Configuration
+# 2. Sidebar Configuration with Project Mode Select
 with st.sidebar:
-    st.header("📥 Input UI Screenshots")
-    uploaded_files = st.file_uploader(
-        "Upload reference app screens:", 
-        type=["png", "jpg", "jpeg"], 
-        accept_multiple_files=True
+    st.header("🎯 Project Strategy Mode")
+    project_mode = st.radio(
+        "Select Workflow Theme:",
+        options=["🆕 Build From Scratch (Greenfield)", "🔄 Change Request / Evolution (Diff Mode)"]
     )
+    
     st.markdown("---")
-    generate_btn = st.button("🚀 Execute LangChain Pipeline", type="primary", disabled=not uploaded_files)
+    st.header("📥 Visual Asset Inputs")
+    
+    # Dynamic Upload Zone Routing based on selected Project Mode
+    if project_mode == "🆕 Build From Scratch (Greenfield)":
+        uploaded_files = st.file_uploader(
+            "Upload complete target UI screenshots:", 
+            type=["png", "jpg", "jpeg"], 
+            accept_multiple_files=True
+        )
+    else:
+        # Evolution Mode requires explicit Baseline vs Target separation
+        baseline_file = st.file_uploader("1. Upload Current Baseline UI (Production Screen):", type=["png", "jpg", "jpeg"])
+        target_file = st.file_uploader("2. Upload Proposed Target Mockup (With Updates):", type=["png", "jpg", "jpeg"])
+        
+        # Consolidate into a list format so down-stream checks remain valid
+        uploaded_files = []
+        if baseline_file: uploaded_files.append(baseline_file)
+        if target_file: uploaded_files.append(target_file)
+
+    st.markdown("---")
+    generate_btn = st.button("🚀 Process Agile Requirements", type="primary", disabled=len(uploaded_files) == 0)
 
 # 3. Main Screen Layout Splitting
-col1, col2 = st.columns([1, 1.5], gap="large")
+col1, col2 = st.columns([1, 1.4], gap="large")
 
 with col1:
-    st.subheader("🖼️ UI Assets")
-    if uploaded_files:
-        for file in uploaded_files:
-            st.image(file, caption=file.name, use_container_width=True)
+    st.subheader("🖼️ Loaded UI Assets")
+    if project_mode == "🆕 Build From Scratch (Greenfield)":
+        if uploaded_files:
+            for file in uploaded_files:
+                st.image(file, caption=f"Scope Asset: {file.name}", use_container_width=True)
+        else:
+            st.info("Upload screenshots to map standard developer user stories.")
     else:
-        st.info("Upload screenshots to map features.")
+        # Visual arrangement for evolution change tracking
+        sub_col1, sub_col2 = st.columns(2)
+        with sub_col1:
+            if baseline_file:
+                st.image(baseline_file, caption="📉 Current Baseline UI", use_container_width=True)
+            else:
+                st.caption("Missing Baseline image.")
+        with sub_col2:
+            if target_file:
+                st.image(target_file, caption="📈 Target Mockup Evolution", use_container_width=True)
+            else:
+                st.caption("Missing Target image.")
+        if not baseline_file or not target_file:
+            st.info("Please upload both baseline and target visual snapshots to run a delta evaluation analysis.")
 
 with col2:
-    st.subheader("⚙️ Agent Routing Activity Logs")
+    st.subheader("📝 Engineering Specifications Workspace")
     
-    if generate_btn and uploaded_files:
-        
-        # Load external system prompts from markdown files
+    if generate_btn and len(uploaded_files) > 0:
         skill_1 = load_skill_file("skills_agent1.md")
         skill_2 = load_skill_file("skills_agent2.md")
         skill_3 = load_skill_file("skills_agent3.md")
         
-        # Ensure all skill files exist before execution
         if skill_1 and skill_2 and skill_3:
             
-            # --- AGENT 1: THE VISUAL AUDITOR (Vision Node) ---
-            with st.status("👁️ LangChain Agent 1: Running UI Pixel Audit...", expanded=True) as status:
-                
-                # Instantiate premium vision LLM via LangChain wrapper
+            # --- AGENT 1: THE VISUAL AUDITOR (With Dynamic Prompt Injection) ---
+            with st.status("👁️ Executing Visual Component Audit...", expanded=True) as status:
                 llm_vision = ChatOpenAI(model="gpt-4o", api_key=api_key_input, temperature=0.1)
                 
-                # Assemble multi-modal content structure required by LangChain
-                human_content = [{"type": "text", "text": "Run a structural elements audit based on these screenshots."}]
+                # Adjust instruction focus dynamically on the fly based on the chosen interface view
+                if project_mode == "🆕 Build From Scratch (Greenfield)":
+                    agent_1_instruction = "Extract all visual elements factually from the provided images."
+                else:
+                    agent_1_instruction = """
+                    You are comparing two images of an evolving interface. The first image represents the current baseline. The second image contains changes or additions.
+                    Your primary mission is to calculate the VISUAL DELTA. Identify what elements are identical, what elements have been modified, and what elements are entirely new in the second mockup. 
+                    Focus 90% of your audit weight describing ONLY the new or changed components.
+                    """
+                
+                human_content = [{"type": "text", "text": agent_1_instruction}]
                 for file in uploaded_files:
                     file.seek(0)
                     b64_string = encode_image(file)
-                    human_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_string}"}
-                    })
+                    human_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_string}"}})
                 
-                # Invoke LangChain model using standardized Message classes
-                messages = [
-                    SystemMessage(content=skill_1),
-                    HumanMessage(content=human_content)
-                ]
-                
+                messages = [SystemMessage(content=skill_1), HumanMessage(content=human_content)]
                 response_1 = llm_vision.invoke(messages)
                 st.session_state.agent_1_output = response_1.content
-                st.write("✅ Factual element extraction completed.")
-                status.update(label="👁️ Agent 1 Chain Executed", state="complete")
+                status.update(label="👁️ Visual Component Mapping Complete", state="complete")
 
-            # --- AGENT 2: THE FUNCTIONAL ARCHITECT (Text Node) ---
-            with st.status("📐 LangChain Agent 2: Computing Atomic Slices...", expanded=True) as status:
-                
-                # Instantiate lightweight model for structured layout transformations
+            # --- AGENT 2: THE FUNCTIONAL ARCHITECT ---
+            with st.status("📐 Calculating Scope Boundaries...", expanded=True) as status:
                 llm_text = ChatOpenAI(model="gpt-4o-mini", api_key=api_key_input, temperature=0.2)
+                
+                # Context adjustment for partitioning agent
+                if project_mode == "🆕 Build From Scratch (Greenfield)":
+                    agent_2_instruction = "Partition these components into clean isolated blocks."
+                else:
+                    agent_2_instruction = "Partition ONLY the changes, modifications, and new delta elements identified by the auditor into standalone evolution requirements nodes. Ignore baseline legacy elements that did not change."
                 
                 messages = [
                     SystemMessage(content=skill_2),
-                    HumanMessage(content=f"Analyze this raw component list and map isolated feature slices:\n\n{st.session_state.agent_1_output}")
+                    HumanMessage(content=f"{agent_2_instruction}\n\nHere is the raw audit payload:\n{st.session_state.agent_1_output}")
                 ]
-                
                 response_2 = llm_text.invoke(messages)
                 st.session_state.agent_2_output = response_2.content
-                st.write("✅ Modular system scope boundaries mapped.")
-                status.update(label="📐 Agent 2 Chain Executed", state="complete")
+                status.update(label="📐 Scope Partitioning Complete", state="complete")
 
-            # --- AGENT 3: THE AGILE WRITER (Text Node) ---
-            with st.status("✍️ LangChain Agent 3: Drafting User Stories & BDD...", expanded=True) as status:
+            # --- AGENT 3: THE AGILE WRITER ---
+            with st.status("✍️ Compiling Engineering User Stories...", expanded=True) as status:
+                
+                if project_mode == "🆕 Build From Scratch (Greenfield)":
+                    agent_3_instruction = "Create developer user stories from these blocks."
+                else:
+                    agent_3_instruction = "Create modification/evolution user stories for developers based on these delta blocks. Frame descriptions around updating an existing component layout rather than building something from scratch."
                 
                 messages = [
                     SystemMessage(content=skill_3),
-                    HumanMessage(content=f"Convert these independent functional boundaries into target stories:\n\n{st.session_state.agent_2_output}")
+                    HumanMessage(content=f"{agent_3_instruction}\n\nHere are the target architectural scope nodes:\n{st.session_state.agent_2_output}")
                 ]
-                
                 response_3 = llm_text.invoke(messages)
                 st.session_state.agent_3_output = response_3.content
-                st.write("✅ Production documentation compiled.")
-                status.update(label="✍️ Agent 3 Chain Executed", state="complete")
+                status.update(label="✍️ Technical Documentation Complete", state="complete")
                 st.rerun()
 
-    # Display clean tab view dashboard of final artifacts
+    # --- THE DUAL-MODE PREVIEW & PLAIN TEXT WORKSPACE ---
     if st.session_state.agent_3_output:
-        st.markdown("### 🏆 Structured Output Inspection")
-        tab1, tab2, tab3 = st.tabs(["📝 Final Agile Artifacts", "📐 Agent 2 Map", "👁️ Agent 1 System Audit"])
-        
-        with tab1:
+        action_col1, action_col2 = st.columns([2, 1])
+        with action_col1:
+            edit_mode = st.toggle("✏️ Switch to Text Edit Mode", value=False)
+        with action_col2:
             st.download_button(
-                label="📥 Download Production Stories (.md)",
+                label="📥 Download Engineering File (.md)",
                 data=st.session_state.agent_3_output,
-                file_name="langchain_multi_agent_stories.md",
+                file_name="developer_user_stories.md",
                 mime="text/markdown"
             )
+            
+        st.markdown("---")
+        
+        if edit_mode:
+            st.session_state.agent_3_output = st.text_area(
+                label="Plain Text Editor",
+                value=st.session_state.agent_3_output,
+                height=550,
+                label_visibility="collapsed"
+            )
+        else:
             st.markdown(st.session_state.agent_3_output)
-            
-        with tab2:
-            st.markdown(st.session_state.agent_2_output)
-            
-        with tab3:
-            st.markdown(st.session_state.agent_1_output)
