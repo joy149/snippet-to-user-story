@@ -1,16 +1,15 @@
 import streamlit as st
 import base64
 import os
-from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # 1. Page Configuration
-st.set_page_config(page_title="LangChain Multi-Agent Stories", layout="wide", page_icon="🦜")
-st.title("🦜 LangChain Multi-Agent User Story Pipeline")
-st.caption("Orchestrating specialized agents via LangChain, utilizing external skill configuration files.")
+st.set_page_config(page_title="Developer User Story Agent", layout="wide", page_icon="⚙️")
+st.title("⚙️ Developer User Story Extraction Engine")
+st.caption("Multi-agent setup with an instant switch between polished reading layout and a clean plain-text workspace.")
 
-# Helper to securely read skill markdown files
+# Helper to read skill markdown files
 def load_skill_file(filename):
     if os.path.exists(filename):
         with open(filename, "r", encoding="utf-8") as f:
@@ -19,17 +18,17 @@ def load_skill_file(filename):
         st.error(f"Missing skill configuration file: `{filename}`")
         return ""
 
-# Helper to encode file strings for LangChain Vision payloads
+# Helper to encode images
 def encode_image(uploaded_file):
     return base64.b64encode(uploaded_file.read()).decode('utf-8')
 
-# Initialize standard state mechanisms
+# Initialize session states
 if "agent_1_output" not in st.session_state: st.session_state.agent_1_output = ""
 if "agent_2_output" not in st.session_state: st.session_state.agent_2_output = ""
 if "agent_3_output" not in st.session_state: st.session_state.agent_3_output = ""
 
-# Set explicit hardcoded API key for prototyping
-api_key_input = "YOUR_OPENAI_API_KEY"  # Replace with your actual OpenAI API key
+# Set explicit API key for prototyping
+api_key_input = "Your-OpenAI-API-Key-Here"  # Replace with your actual OpenAI API key
 
 # 2. Sidebar Configuration
 with st.sidebar:
@@ -40,105 +39,92 @@ with st.sidebar:
         accept_multiple_files=True
     )
     st.markdown("---")
-    generate_btn = st.button("🚀 Execute LangChain Pipeline", type="primary", disabled=not uploaded_files)
+    generate_btn = st.button("🚀 Process Developer Stories", type="primary", disabled=not uploaded_files)
 
 # 3. Main Screen Layout Splitting
-col1, col2 = st.columns([1, 1.5], gap="large")
+col1, col2 = st.columns([1, 1.4], gap="large")
 
 with col1:
-    st.subheader("🖼️ UI Assets")
+    st.subheader("🖼️ Loaded UI Assets")
     if uploaded_files:
         for file in uploaded_files:
             st.image(file, caption=file.name, use_container_width=True)
     else:
-        st.info("Upload screenshots to map features.")
+        st.info("Upload screenshots to map developer stories.")
 
 with col2:
-    st.subheader("⚙️ Agent Routing Activity Logs")
+    st.subheader("📝 Engineering Specifications Workspace")
     
     if generate_btn and uploaded_files:
-        
-        # Load external system prompts from markdown files
         skill_1 = load_skill_file("skills_agent1.md")
         skill_2 = load_skill_file("skills_agent2.md")
         skill_3 = load_skill_file("skills_agent3.md")
         
-        # Ensure all skill files exist before execution
         if skill_1 and skill_2 and skill_3:
             
-            # --- AGENT 1: THE VISUAL AUDITOR (Vision Node) ---
-            with st.status("👁️ LangChain Agent 1: Running UI Pixel Audit...", expanded=True) as status:
-                
-                # Instantiate premium vision LLM via LangChain wrapper
+            # --- AGENT 1: THE VISUAL AUDITOR ---
+            with st.status("👁️ Executing Visual Component Audit...", expanded=True) as status:
                 llm_vision = ChatOpenAI(model="gpt-4o", api_key=api_key_input, temperature=0.1)
-                
-                # Assemble multi-modal content structure required by LangChain
-                human_content = [{"type": "text", "text": "Run a structural elements audit based on these screenshots."}]
+                human_content = [{"type": "text", "text": "Extract all visual elements factually."}]
                 for file in uploaded_files:
                     file.seek(0)
                     b64_string = encode_image(file)
-                    human_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_string}"}
-                    })
+                    human_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_string}"}})
                 
-                # Invoke LangChain model using standardized Message classes
-                messages = [
-                    SystemMessage(content=skill_1),
-                    HumanMessage(content=human_content)
-                ]
-                
+                messages = [SystemMessage(content=skill_1), HumanMessage(content=human_content)]
                 response_1 = llm_vision.invoke(messages)
                 st.session_state.agent_1_output = response_1.content
-                st.write("✅ Factual element extraction completed.")
-                status.update(label="👁️ Agent 1 Chain Executed", state="complete")
+                status.update(label="👁️ Visual Components Extracted", state="complete")
 
-            # --- AGENT 2: THE FUNCTIONAL ARCHITECT (Text Node) ---
-            with st.status("📐 LangChain Agent 2: Computing Atomic Slices...", expanded=True) as status:
-                
-                # Instantiate lightweight model for structured layout transformations
+            # --- AGENT 2: THE FUNCTIONAL ARCHITECT ---
+            with st.status("📐 Calculating Component Boundaries...", expanded=True) as status:
                 llm_text = ChatOpenAI(model="gpt-4o-mini", api_key=api_key_input, temperature=0.2)
-                
                 messages = [
                     SystemMessage(content=skill_2),
-                    HumanMessage(content=f"Analyze this raw component list and map isolated feature slices:\n\n{st.session_state.agent_1_output}")
+                    HumanMessage(content=f"Partition these components:\n\n{st.session_state.agent_1_output}")
                 ]
-                
                 response_2 = llm_text.invoke(messages)
                 st.session_state.agent_2_output = response_2.content
-                st.write("✅ Modular system scope boundaries mapped.")
-                status.update(label="📐 Agent 2 Chain Executed", state="complete")
+                status.update(label="📐 Component Boundaries Mapped", state="complete")
 
-            # --- AGENT 3: THE AGILE WRITER (Text Node) ---
-            with st.status("✍️ LangChain Agent 3: Drafting User Stories & BDD...", expanded=True) as status:
-                
+            # --- AGENT 3: THE AGILE WRITER ---
+            with st.status("✍️ Compiling Engineering User Stories...", expanded=True) as status:
                 messages = [
                     SystemMessage(content=skill_3),
-                    HumanMessage(content=f"Convert these independent functional boundaries into target stories:\n\n{st.session_state.agent_2_output}")
+                    HumanMessage(content=f"Create developer user stories from these blocks:\n\n{st.session_state.agent_2_output}")
                 ]
-                
                 response_3 = llm_text.invoke(messages)
                 st.session_state.agent_3_output = response_3.content
-                st.write("✅ Production documentation compiled.")
-                status.update(label="✍️ Agent 3 Chain Executed", state="complete")
+                status.update(label="✍️ Engineering Stories Compiled", state="complete")
                 st.rerun()
 
-    # Display clean tab view dashboard of final artifacts
+    # --- THE DUAL-MODE PREVIEW & EDIT UTILITY ---
     if st.session_state.agent_3_output:
-        st.markdown("### 🏆 Structured Output Inspection")
-        tab1, tab2, tab3 = st.tabs(["📝 Final Agile Artifacts", "📐 Agent 2 Map", "👁️ Agent 1 System Audit"])
         
-        with tab1:
+        # Action Bar Row
+        action_col1, action_col2 = st.columns([1, 1])
+        with action_col1:
+            # Simple clickable view toggle switch
+            edit_mode = st.toggle("✏️ Switch to Text Edit Mode", value=False)
+        with action_col2:
+            # Download button always saves clean Markdown format in the background
             st.download_button(
-                label="📥 Download Production Stories (.md)",
+                label="📥 Download as Markdown File (.md)",
                 data=st.session_state.agent_3_output,
-                file_name="langchain_multi_agent_stories.md",
+                file_name="developer_user_stories.md",
                 mime="text/markdown"
             )
+            
+        st.markdown("---")
+        
+        if edit_mode:
+            # Mode A: Clean Text Workspace for simple editing without layout clutter
+            st.session_state.agent_3_output = st.text_area(
+                label="Plain Text Editor",
+                value=st.session_state.agent_3_output,
+                height=550,
+                label_visibility="collapsed"
+            )
+        else:
+            # Mode B: Supreme, beautiful executive layout for client review
             st.markdown(st.session_state.agent_3_output)
-            
-        with tab2:
-            st.markdown(st.session_state.agent_2_output)
-            
-        with tab3:
-            st.markdown(st.session_state.agent_1_output)
