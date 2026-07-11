@@ -262,7 +262,7 @@ with col2:
             # --- VISUAL AGENT: THE VISUAL AUDITOR ---
             with st.status("👁️ Executing Visual Component Audit...", expanded=True) as status:
                 try:
-                    llm_vision = ChatOpenAI(model="gpt-4o", api_key=api_key_input, temperature=0.1)
+                    llm_vision = ChatOpenAI(model="gpt-5.5", api_key=api_key_input, temperature=0.1)
                     human_content = [{"type": "text", "text": "Extract all visual elements factually."}]
                     
                     for file in uploaded_files:
