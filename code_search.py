@@ -1,0 +1,425 @@
+"""
+code_search.py — Semantic Code Search via Embedding Index
+
+Fetches all source files from a repo concurrently, chunks them by code
+boundaries, embeds via OpenAI text-embedding-3-small, and provides
+semantic search against arbitrary query text (typically the UI audit).
+
+Design constraints:
+  - Thread-safe, no Streamlit imports — safe to call from background threads.
+  - The OpenAI client is always passed explicitly (never imported from app.py)
+    so the module stays testable and decoupled.
+  - The caller (app.py) owns session-level caching of the CodeIndex object,
+    using the same main-thread-only st.session_state pattern as the existing
+    repo bundle cache.
+  - Brute-force cosine similarity via NumPy — no FAISS/pgvector needed at
+    repo scale (~2000 chunks, sub-millisecond search).
+
+Cost note:
+  text-embedding-3-small costs ~$0.02/M tokens.  A 300-file repo averaging
+  ~1500 tokens/file ≈ 450K tokens ≈ $0.009.  Cached per session.
+"""
+
+import re
+import numpy as np
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+
+import github_context
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIMENSIONS = 1536
+EMBED_BATCH_SIZE = 100          # OpenAI embeddings endpoint accepts batch input
+
+CHUNK_MAX_CHARS = 2400          # ~600 tokens — upper bound for a single chunk
+CHUNK_MIN_CHARS = 200           # don't create tiny, meaningless chunks
+SLIDING_WINDOW_CHARS = 1600     # ~400 tokens — fallback fixed-size window
+SLIDING_OVERLAP_CHARS = 400     # 25% overlap between adjacent windows
+
+MAX_FETCH_WORKERS = 15          # concurrent raw.githubusercontent.com fetches
+MAX_FETCH_CHARS = 6000          # per-file content cap for indexing
+
+
+# ---------------------------------------------------------------------------
+# Boundary detection patterns (per-language)
+# ---------------------------------------------------------------------------
+# Used to split files at meaningful code boundaries (function/class/component
+# definitions) before falling back to a dumb sliding window.
+
+_BOUNDARY_PATTERNS = [
+    # Python: class and function definitions (including async)
+    re.compile(r"^(?:async\s+)?(?:def|class)\s+\w+", re.MULTILINE),
+    # JS/TS: function/class declarations, optionally exported
+    re.compile(
+        r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function\s+\w+|class\s+\w+)",
+        re.MULTILINE,
+    ),
+    # JS/TS: const/let/var arrow-function or function-expression assignments
+    # (catches React component definitions like `const Panel3 = () => {`)
+    re.compile(
+        r"^(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:\([^)]*\)\s*=>|function)",
+        re.MULTILINE,
+    ),
+    # Go: func declarations
+    re.compile(r"^func\s+", re.MULTILINE),
+    # Ruby: def/class/module
+    re.compile(r"^(?:def|class|module)\s+\w+", re.MULTILINE),
+    # Java/Kotlin/C#: class/interface/enum declarations
+    re.compile(
+        r"^\s*(?:public|private|protected|internal)?\s*"
+        r"(?:static\s+)?(?:abstract\s+)?(?:class|interface|enum|object)\s+\w+",
+        re.MULTILINE,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChunkMeta:
+    """Metadata for a single chunk of code from one file."""
+    file_path: str
+    chunk_index: int
+    start_line: int       # 1-indexed line number within the original file
+    text: str
+
+
+@dataclass
+class SearchHit:
+    """A single semantic search result, deduplicated to one per file."""
+    file_path: str
+    score: float          # cosine similarity, 0–1
+    chunk_text: str       # preview of the best-matching chunk
+    chunk_meta: ChunkMeta
+
+
+@dataclass
+class CodeIndex:
+    """
+    In-memory embedding index for a repository's source files.
+
+    vectors:       (N, 1536) float32 array — one row per chunk.
+    chunks:        parallel list of ChunkMeta — chunks[i] describes vectors[i].
+    file_contents: path → raw content string — pre-fetched content that can be
+                   reused downstream to avoid re-downloading.
+    """
+    vectors: np.ndarray
+    chunks: list           # list[ChunkMeta]
+    file_contents: dict    # dict[str, str]
+
+
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
+def _find_boundaries(text):
+    """Return sorted, deduplicated line numbers where code boundaries occur."""
+    boundaries = set()
+    for pattern in _BOUNDARY_PATTERNS:
+        for match in pattern.finditer(text):
+            line_num = text[:match.start()].count("\n")
+            boundaries.add(line_num)
+    return sorted(boundaries)
+
+
+def _sliding_window_chunks(text, base_line):
+    """Split text into overlapping fixed-size chunks (fallback strategy)."""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + SLIDING_WINDOW_CHARS, len(text))
+        chunk_text = text[start:end]
+
+        if len(chunk_text) < CHUNK_MIN_CHARS and chunks:
+            # Remainder is too small — append to previous chunk instead of
+            # creating a useless sliver.
+            chunks[-1] = ChunkMeta(
+                file_path=chunks[-1].file_path,
+                chunk_index=chunks[-1].chunk_index,
+                start_line=chunks[-1].start_line,
+                text=chunks[-1].text + chunk_text,
+            )
+            break
+
+        line_offset = text[:start].count("\n")
+        chunks.append(ChunkMeta(
+            file_path="",          # caller fills this in
+            chunk_index=0,         # caller re-indexes
+            start_line=base_line + line_offset + 1,
+            text=chunk_text,
+        ))
+
+        step = SLIDING_WINDOW_CHARS - SLIDING_OVERLAP_CHARS
+        if start + step <= start:
+            break  # safety: avoid infinite loop
+        start += step
+
+    return chunks
+
+
+def chunk_file(file_path, content):
+    """
+    Split a single file into chunks, preferring code-boundary splitting and
+    falling back to a sliding window when no boundaries are detected.
+
+    Returns a list of ChunkMeta (may be empty for blank files).
+    """
+    if not content or not content.strip():
+        return []
+
+    lines = content.split("\n")
+    boundaries = _find_boundaries(content)
+
+    chunks = []
+
+    if len(boundaries) >= 2:
+        # ---- Boundary-based chunking ----
+        # Ensure we cover the file from line 0
+        if boundaries[0] != 0:
+            boundaries = [0] + boundaries
+
+        for i in range(len(boundaries)):
+            start_line = boundaries[i]
+            end_line = boundaries[i + 1] if i + 1 < len(boundaries) else len(lines)
+            chunk_text = "\n".join(lines[start_line:end_line])
+
+            if len(chunk_text) > CHUNK_MAX_CHARS:
+                # Oversized boundary segment — sub-split with sliding window
+                sub_chunks = _sliding_window_chunks(chunk_text, start_line)
+                for sc in sub_chunks:
+                    sc.file_path = file_path
+                chunks.extend(sub_chunks)
+            elif len(chunk_text) >= CHUNK_MIN_CHARS:
+                chunks.append(ChunkMeta(
+                    file_path=file_path,
+                    chunk_index=0,
+                    start_line=start_line + 1,   # 1-indexed
+                    text=chunk_text,
+                ))
+            else:
+                # Tiny segment (e.g. a single import line before the first real
+                # boundary) — merge it into the next chunk if possible, or keep
+                # it if it's the only content.
+                if chunks:
+                    prev = chunks[-1]
+                    chunks[-1] = ChunkMeta(
+                        file_path=prev.file_path,
+                        chunk_index=prev.chunk_index,
+                        start_line=prev.start_line,
+                        text=prev.text + "\n" + chunk_text,
+                    )
+                # else: will be picked up as part of the next boundary segment
+
+    if not chunks:
+        # ---- Fallback: sliding window over entire file ----
+        chunks = _sliding_window_chunks(content, 0)
+        for c in chunks:
+            c.file_path = file_path
+
+    # Re-index sequentially
+    for i, c in enumerate(chunks):
+        c.chunk_index = i
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# File fetching (concurrent)
+# ---------------------------------------------------------------------------
+
+def _fetch_one_file(owner, repo, branch, path):
+    """Fetch a single file. Returns (path, content_or_None)."""
+    try:
+        content = github_context.fetch_raw_file(
+            owner, repo, branch, path, max_chars=MAX_FETCH_CHARS,
+        )
+        return path, content
+    except Exception:
+        return path, None
+
+
+def fetch_all_files(owner, repo, branch, paths):
+    """
+    Fetch content for all paths concurrently via raw.githubusercontent.com.
+    Returns dict[path, content] (only successfully fetched files).
+    """
+    if not paths:
+        return {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as executor:
+        futures = [
+            executor.submit(_fetch_one_file, owner, repo, branch, path)
+            for path in paths
+        ]
+        for future in futures:
+            path, content = future.result()
+            if content is not None:
+                results[path] = content
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
+
+def _embed_texts(client, texts):
+    """
+    Embed a list of text strings using OpenAI's embeddings API.
+    Returns an (N, EMBED_DIMENSIONS) float32 NumPy array.
+    """
+    if not texts:
+        return np.empty((0, EMBED_DIMENSIONS), dtype=np.float32)
+
+    all_embeddings = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i : i + EMBED_BATCH_SIZE]
+        response = client.embeddings.create(model=EMBED_MODEL, input=batch)
+        # response.data is ordered by index, but sort to be safe
+        sorted_data = sorted(response.data, key=lambda d: d.index)
+        all_embeddings.extend([item.embedding for item in sorted_data])
+
+    return np.array(all_embeddings, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Index building
+# ---------------------------------------------------------------------------
+
+def build_index(client, owner, repo, branch, paths):
+    """
+    Build a CodeIndex: fetch all files → chunk → embed.
+
+    Args:
+        client:  OpenAI client instance (for embeddings).
+        owner, repo, branch:  GitHub repo coordinates.
+        paths:   File paths to index (typically bundle["path_listing"]).
+
+    Returns (CodeIndex, error_message).
+        On success: (index, None).
+        On failure:  (None, "human-readable reason").
+    """
+    # 1. Fetch all file contents concurrently
+    try:
+        file_contents = fetch_all_files(owner, repo, branch, paths)
+    except Exception as e:
+        return None, f"Failed to fetch repo files for indexing: {e}"
+
+    if not file_contents:
+        return None, "No file content could be fetched for indexing."
+
+    # 2. Chunk every file
+    all_chunks = []
+    for path in sorted(file_contents.keys()):
+        file_chunks = chunk_file(path, file_contents[path])
+        all_chunks.extend(file_chunks)
+
+    if not all_chunks:
+        return None, "All fetched files produced zero usable chunks."
+
+    # 3. Embed all chunks
+    try:
+        chunk_texts = [c.text for c in all_chunks]
+        vectors = _embed_texts(client, chunk_texts)
+    except Exception as e:
+        return None, f"Embedding API call failed: {e}"
+
+    return CodeIndex(
+        vectors=vectors,
+        chunks=all_chunks,
+        file_contents=file_contents,
+    ), None
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+def search(client, index, query, top_k=15):
+    """
+    Semantic search: find the files whose code content is most similar to
+    the query text (typically the UI audit output).
+
+    Returns a list of SearchHit, deduplicated to one per file (highest
+    scoring chunk wins), sorted by descending similarity, up to top_k files.
+    """
+    if index is None or len(index.chunks) == 0:
+        return []
+
+    # Embed the query
+    try:
+        query_vec = _embed_texts(client, [query])[0]
+    except Exception:
+        return []   # graceful degradation — no semantic hits this run
+
+    # Cosine similarity — OpenAI embeddings are pre-normalized, but normalize
+    # defensively in case of numerical drift or future model changes.
+    norms = np.linalg.norm(index.vectors, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    normalized_vecs = index.vectors / norms
+
+    query_norm = np.linalg.norm(query_vec)
+    if query_norm > 0:
+        query_vec = query_vec / query_norm
+
+    similarities = normalized_vecs @ query_vec          # shape (N,)
+
+    # Rank and deduplicate by file path (keep best chunk per file)
+    top_indices = np.argsort(similarities)[::-1]
+
+    seen_files = {}
+    for idx in top_indices:
+        idx = int(idx)
+        chunk = index.chunks[idx]
+        score = float(similarities[idx])
+        if chunk.file_path not in seen_files:
+            seen_files[chunk.file_path] = SearchHit(
+                file_path=chunk.file_path,
+                score=score,
+                chunk_text=chunk.text[:300],
+                chunk_meta=chunk,
+            )
+        if len(seen_files) >= top_k:
+            break
+
+    return sorted(seen_files.values(), key=lambda h: h.score, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Prompt formatting
+# ---------------------------------------------------------------------------
+
+def format_hits_for_prompt(hits, max_hits=10):
+    """
+    Format search hits as a markdown table suitable for injection into the
+    file-selector LLM prompt (Pass 1).
+
+    Returns an empty string if there are no hits — callers can use truthiness
+    to decide whether to include the section.
+    """
+    if not hits:
+        return ""
+
+    lines = [
+        "🔎 **Semantic search hits** (files whose ACTUAL CODE CONTENT is most "
+        "similar to the UI audit — these may have unintuitive names but contain "
+        "relevant code):\n",
+        "| Rank | File Path | Similarity | Code Preview |",
+        "| :--- | :--- | :--- | :--- |",
+    ]
+
+    for i, hit in enumerate(hits[:max_hits], 1):
+        # Sanitize the preview for safe table embedding
+        preview = hit.chunk_text.replace("\n", " ").replace("|", "\\|")
+        if len(preview) > 120:
+            preview = preview[:120]
+        lines.append(
+            f"| {i} | `{hit.file_path}` | {hit.score:.2f} | `{preview}…` |"
+        )
+
+    return "\n".join(lines)
