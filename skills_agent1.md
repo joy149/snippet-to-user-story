@@ -15,6 +15,7 @@ For every image provided, catalog your findings strictly under the following mar
 
 ### 📱 Screen Context Identification
 - **Implicit Title:** [The exact text found in the primary header or window title banner]
+- **Browser/Route Context:** [If any browser chrome is visible in the screenshot — address bar, tab title — transcribe the URL/path exactly, e.g. "oralscreen-frontend.onrender.com/doctor/case/2f3c128a-...". This is a critical downstream grounding signal: URL path segments (e.g. "/doctor/case/", "/questionnaire/.../assessment") often correspond directly to real route, page, or component names in the actual codebase. If no browser chrome is visible, write "Not visible in screenshot."]
 - **Structural Identifiers:** [List visible breadcrumbs, multi-step progress steps (e.g., 'Step 2 of 5'), system environment indicators, or active tabs]
 
 ### 📊 Structural Layout & Component Inventory

@@ -5,6 +5,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 import github_context
+import code_search
 from pipeline_utils import split_into_feature_nodes
 
 # 1. Page Configuration
@@ -69,7 +70,8 @@ def call_openai(model, system_prompt, user_content, max_tokens=2000):
     return content
 
 
-def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, cached_bundle=None):
+def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output,
+                                cached_bundle=None, cached_code_index=None):
     """
     The full repo-context enrichment path (raw fetch -> file selector LLM pass ->
     architecture LLM pass), factored out so it contains NO Streamlit calls and is
@@ -82,22 +84,25 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, c
 
     Per-session caching (item 2) is handled entirely by the CALLER on the main
     thread: st.session_state must never be read or written from a background
-    thread in Streamlit, so this function accepts an already-fetched `cached_bundle`
-    if the caller has one, and — when it has to fetch fresh — returns that bundle
-    back in the result dict under "bundle_to_cache" so the caller can store it
+    thread in Streamlit, so this function accepts already-cached objects
+    (cached_bundle, cached_code_index) if the caller has them, and — when it
+    has to build fresh — returns them back in the result dict under
+    "bundle_to_cache" / "code_index_to_cache" so the caller can store them
     after the thread finishes, on the main thread.
 
     Returns a dict:
       {"context": str, "status": str, "raw_snippets": str, "warning": str|None,
-       "bundle_to_cache": dict|None}
+       "bundle_to_cache": dict|None, "code_index_to_cache": CodeIndex|None}
     """
     if not github_repo_url.strip():
         return {
             "context": "",
             "status": "No repo URL provided — stories written without repo grounding.",
             "raw_snippets": "",
+            "semantic_hits": "",
             "warning": None,
             "bundle_to_cache": None,
+            "code_index_to_cache": None,
         }
 
     from_cache = cached_bundle is not None
@@ -111,12 +116,36 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, c
             "context": "",
             "status": f"❌ Skipped — {ctx_err}",
             "raw_snippets": "",
+            "semantic_hits": "",
             "warning": f"Repo context skipped: {ctx_err}",
             "bundle_to_cache": None,
+            "code_index_to_cache": None,
         }
 
     cache_note = " _(reused from an earlier fetch this session)_" if from_cache else ""
 
+    # --- Semantic code search: build or reuse the embedding index ---
+    code_index = cached_code_index
+    code_index_to_cache = None
+    semantic_hits_block = ""
+    index_warning = None
+
+    if code_index is None and bundle["path_listing"]:
+        code_index, idx_err = code_search.build_index(
+            client,
+            bundle["owner"], bundle["repo"], bundle["branch"],
+            bundle["path_listing"],
+        )
+        if idx_err:
+            index_warning = f"Semantic code index skipped: {idx_err}"
+        if code_index is not None:
+            code_index_to_cache = code_index    # caller caches on main thread
+
+    if code_index is not None:
+        hits = code_search.search(client, code_index, agent_1_output, top_k=15)
+        semantic_hits_block = code_search.format_hits_for_prompt(hits, max_hits=10)
+
+    # --- Build the file-selector prompt ---
     skill_repo_synth = load_skill_file("skills_repo_synth.md")
     path_listing_text = "\n".join(bundle["path_listing"])
     truncation_note = (
@@ -124,13 +153,23 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, c
         "treat absence from this list as 'unknown', not 'doesn't exist'.)"
         if bundle["path_listing_truncated"] else ""
     )
+
+    # Inject semantic hits (if any) between the UI audit and the path listing,
+    # so the LLM sees content-based evidence BEFORE reasoning over bare paths.
+    semantic_section = (
+        f"\n\n{semantic_hits_block}\n"
+        if semantic_hits_block
+        else ""
+    )
+
     selector_user_content = [{
         "type": "text",
         "text": (
             f"UI audit (what the screenshot(s) show, including any requested changes):\n"
             f"{agent_1_output}\n\n"
             f"Detected tech stack:\n{bundle['tech_stack']}\n\n"
-            f"Top-level structure: {bundle['top_level']}\n\n"
+            f"Top-level structure: {bundle['top_level']}"
+            f"{semantic_section}\n\n"
             f"Source file path listing ({len(bundle['path_listing'])} files):"
             f"{truncation_note}\n{path_listing_text}"
         ),
@@ -146,13 +185,15 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, c
             "context": "",
             "status": "❌ Skipped — file selector LLM call failed.",
             "raw_snippets": "",
+            "semantic_hits": semantic_hits_block,
             "warning": f"Repo file-selector call failed: {sel_err}" if sel_err else None,
             "bundle_to_cache": bundle_to_cache,
+            "code_index_to_cache": code_index_to_cache,
         }
 
     # --- Item 1: robust path extraction with an explicit fallback signal ---
     picked_paths, used_fallback = github_context.extract_picked_paths(selector_brief)
-    warning = None
+    warning = index_warning   # carry forward any index-build warning
     if used_fallback:
         warning = (
             "Heads up: the file-selector step didn't wrap its picked paths in backticks "
@@ -168,7 +209,7 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, c
     snippets = github_context.fetch_files_by_paths(
         bundle["owner"], bundle["repo"], bundle["branch"],
         picked_paths, bundle["tree_files"],
-        max_chars=2500, max_files=8,
+        max_chars=2500, max_files=12,
     )
 
     if not snippets:
@@ -184,8 +225,10 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, c
                 f"(net-new functionality)."
             ),
             "raw_snippets": "",
+            "semantic_hits": semantic_hits_block,
             "warning": warning,
             "bundle_to_cache": bundle_to_cache,
+            "code_index_to_cache": code_index_to_cache,
         }
 
     skill_repo_arch = load_skill_file("skills_repo_architecture.md")
@@ -204,6 +247,12 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, c
         arch_warning = f"Architecture synthesis call failed: {arch_err}" if arch_err else None
         warning = f"{warning} {arch_warning}" if (warning and arch_warning) else (warning or arch_warning)
 
+    # Include semantic hit count in the status line for visibility
+    semantic_note = ""
+    if semantic_hits_block:
+        hit_count = semantic_hits_block.count("\n|") - 2   # subtract header rows
+        semantic_note = f" Semantic code index: {hit_count} content-matched file(s) surfaced."
+
     return {
         "context": (
             f"### Repository: `{bundle['owner']}/{bundle['repo']}` (branch: `{bundle['branch']}`){cache_note}\n\n"
@@ -213,16 +262,18 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output, c
         "status": (
             f"✅ Grounded against `{bundle['owner']}/{bundle['repo']}` "
             f"— {len(snippets)} real file(s) read and analyzed for actual "
-            f"architecture/style, not just dependency-checked."
+            f"architecture/style, not just dependency-checked.{semantic_note}"
         ),
         "raw_snippets": "\n\n".join(snippets),
+        "semantic_hits": semantic_hits_block,
         "warning": warning,
         "bundle_to_cache": bundle_to_cache,
+        "code_index_to_cache": code_index_to_cache,
     }
 
 # Initialize session states
 for key in ["agent_1_output", "agent_2_output", "agent_3_output", "repo_context",
-            "repo_context_status", "repo_context_raw_snippets"]:
+            "repo_context_status", "repo_context_raw_snippets", "repo_semantic_hits"]:
     if key not in st.session_state:
         st.session_state[key] = ""
 
@@ -236,6 +287,12 @@ for key in ["agent_1_output", "agent_2_output", "agent_3_output", "repo_context"
 # thread, since st.session_state access isn't safe off the main script thread.
 if "repo_bundle_cache" not in st.session_state:
     st.session_state.repo_bundle_cache = {}
+
+# Cache of embedding indexes keyed by repo URL, so re-running the pipeline
+# against the same repo doesn't re-fetch + re-embed all files.  Same
+# main-thread-only constraint as the bundle cache above.
+if "code_index_cache" not in st.session_state:
+    st.session_state.code_index_cache = {}
 
 
 def _bundle_cache_key(repo_url):
@@ -251,6 +308,17 @@ def cache_bundle(repo_url, bundle):
     """Main-thread-only write to the repo bundle cache."""
     if bundle is not None:
         st.session_state.repo_bundle_cache[_bundle_cache_key(repo_url)] = bundle
+
+
+def get_cached_code_index(repo_url):
+    """Main-thread-only read of the code embedding index cache. Returns CodeIndex or None."""
+    return st.session_state.code_index_cache.get(_bundle_cache_key(repo_url))
+
+
+def cache_code_index(repo_url, code_index):
+    """Main-thread-only write to the code embedding index cache."""
+    if code_index is not None:
+        st.session_state.code_index_cache[_bundle_cache_key(repo_url)] = code_index
 
 # 2. Sidebar Configuration
 with st.sidebar:
@@ -329,15 +397,19 @@ with col2:
 
                 # Nothing else to overlap this with in collapse mode (there's no
                 # separate Agent 2 call to parallelize against), so run it plainly.
-                with st.status("🔗 Running repo context enrichment...", expanded=True) as status:
+                with st.status("🔗 Running repo context enrichment (incl. semantic code index)...", expanded=True) as status:
                     cached_bundle = get_cached_bundle(github_repo_url) if github_repo_url.strip() else None
+                    cached_code_idx = get_cached_code_index(github_repo_url) if github_repo_url.strip() else None
                     repo_result = run_repo_grounding_pipeline(
-                        github_repo_url, github_token, st.session_state.agent_1_output, cached_bundle=cached_bundle,
+                        github_repo_url, github_token, st.session_state.agent_1_output,
+                        cached_bundle=cached_bundle, cached_code_index=cached_code_idx,
                     )
                     cache_bundle(github_repo_url, repo_result["bundle_to_cache"])
+                    cache_code_index(github_repo_url, repo_result["code_index_to_cache"])
                     st.session_state.repo_context = repo_result["context"]
                     st.session_state.repo_context_status = repo_result["status"]
                     st.session_state.repo_context_raw_snippets = repo_result["raw_snippets"]
+                    st.session_state.repo_semantic_hits = repo_result["semantic_hits"]
                     if repo_result["warning"]:
                         st.warning(repo_result["warning"])
                     status.update(label="🔗 Repo Grounding Complete", state="complete")
@@ -357,10 +429,11 @@ with col2:
                 # needs Agent 1's output — neither depends on the other's result. Running them
                 # concurrently cuts wall-clock time instead of paying for both sequentially.
                 with st.status("📐🔗 Mapping component boundaries + grounding against repo...", expanded=True) as status:
-                    # Cache read happens here, on the main thread, BEFORE handing off
+                    # Cache reads happen here, on the main thread, BEFORE handing off
                     # to the background thread — st.session_state must never be
                     # touched from inside a background thread in Streamlit.
                     cached_bundle = get_cached_bundle(github_repo_url) if github_repo_url.strip() else None
+                    cached_code_idx = get_cached_code_index(github_repo_url) if github_repo_url.strip() else None
 
                     with ThreadPoolExecutor(max_workers=2) as executor:
                         agent2_future = executor.submit(
@@ -369,7 +442,7 @@ with col2:
                         )
                         repo_future = executor.submit(
                             run_repo_grounding_pipeline, github_repo_url, github_token,
-                            st.session_state.agent_1_output, cached_bundle,
+                            st.session_state.agent_1_output, cached_bundle, cached_code_idx,
                         )
                         result_2, err_2 = agent2_future.result()
                         repo_result = repo_future.result()
@@ -379,13 +452,15 @@ with col2:
                         st.stop()
                     st.session_state.agent_2_output = result_2
 
-                    # Cache write also happens back on the main thread, after the
+                    # Cache writes also happen back on the main thread, after the
                     # background thread has fully finished.
                     cache_bundle(github_repo_url, repo_result["bundle_to_cache"])
+                    cache_code_index(github_repo_url, repo_result["code_index_to_cache"])
 
                     st.session_state.repo_context = repo_result["context"]
                     st.session_state.repo_context_status = repo_result["status"]
                     st.session_state.repo_context_raw_snippets = repo_result["raw_snippets"]
+                    st.session_state.repo_semantic_hits = repo_result["semantic_hits"]
                     if repo_result["warning"]:
                         st.warning(repo_result["warning"])
 
@@ -404,12 +479,25 @@ with col2:
                 story_sections = []
                 for i, node_chunk in enumerate(node_chunks, start=1):
                     status.update(label=f"✍️ Compiling User Stories — Feature Node {i}/{len(node_chunks)}...")
-                    repo_context_block = (
-                        f"\n\nExisting repository context (ground your tasks and file references in this "
-                        f"where relevant — reference real paths/conventions instead of generic scaffolding):\n"
-                        f"{st.session_state.repo_context}"
-                        if st.session_state.repo_context else ""
-                    )
+                    if st.session_state.repo_context:
+                        repo_context_block = (
+                            f"\n\nExisting repository context (ground your tasks and file references in this "
+                            f"where relevant — reference real paths/conventions instead of generic scaffolding):\n"
+                            f"{st.session_state.repo_context}"
+                        )
+                    else:
+                        # Deterministic, code-level reinforcement of the skill's "no repo
+                        # context -> treat as complete scratch development" rule. Repeated
+                        # per-node-call rather than relying solely on one line inside a long
+                        # system prompt to be recalled reliably every time.
+                        repo_context_block = (
+                            "\n\nNo repository context is available for this feature node "
+                            "(either no GitHub URL was provided, or the grounding lookup did not "
+                            "succeed). Treat this feature node as complete, from-scratch "
+                            "development: do not reference, guess at, or imply any existing file "
+                            "path, dependency, symbol, or pattern. Every technical task should "
+                            "describe building the component/endpoint new, in generic terms."
+                        )
                     user_content = [{
                         "type": "text",
                         "text": (
@@ -446,6 +534,9 @@ with col2:
         if st.session_state.repo_context:
             with st.expander("🔍 View the actual repo grounding brief used for this run"):
                 st.markdown(st.session_state.repo_context)
+            if st.session_state.repo_semantic_hits:
+                with st.expander("🔎 View semantic code search hits (content-based file matching)"):
+                    st.markdown(st.session_state.repo_semantic_hits)
             if st.session_state.repo_context_raw_snippets:
                 with st.expander("📄 View the raw fetched code the analysis above is based on"):
                     st.markdown(st.session_state.repo_context_raw_snippets)

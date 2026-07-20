@@ -2,6 +2,7 @@
 streamlit>=1.32,<2.0        # st.status(), st.toggle() require >=1.25/1.27; pinned to a modern floor
 openai>=1.12,<2.0           # uses the v1 client.chat.completions.create interface
 requests>=2.31,<3.0
+numpy>=1.26,<3.0              # brute-force cosine similarity for code_search.py embedding index
 
 # Dev / test dependencies (not required to run the app, only to run the test suite)
 pytest>=8.0,<9.0
