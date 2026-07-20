@@ -30,6 +30,13 @@ import requests
 GITHUB_API_BASE = "https://api.github.com"
 RAW_BASE = "https://raw.githubusercontent.com"
 
+# Matches a file path wrapped in backticks with a recognizable extension, e.g. `src/foo/Bar.jsx`
+_BACKTICK_PATH_RE = re.compile(r"`([^`\s]+\.[a-zA-Z0-9]{1,10})`")
+# Fallback: same shape but without requiring backticks (in case the model drops them),
+# anchored so we don't grab stray sentence fragments — must look like a path (contains a slash
+# or a dot before the extension) and be reasonably path-like (no spaces).
+_BARE_PATH_RE = re.compile(r"(?<![`\w])([\w./\-]+/[\w.\-]+\.[a-zA-Z0-9]{1,10})(?![`\w])")
+
 EXCLUDED_DIR_PARTS = {
     "node_modules", "dist", "build", ".git", "vendor", "venv", ".venv",
     "__pycache__", "coverage", ".next", "target", "bin", "obj",
@@ -50,6 +57,43 @@ MANIFEST_FILES = {
 }
 
 
+def extract_picked_paths(selector_brief):
+    """
+    Pull candidate file paths out of the file-selector LLM's free-text output.
+
+    The skill instructs the model to wrap paths in backticks, but models don't
+    always comply exactly, and previously any deviation meant we'd silently
+    fall back to zero picked files (repo grounding degrades quietly with no
+    visible signal to the user). This function:
+      1. Tries the strict backtick-wrapped pattern first (what the skill asks for).
+      2. If that yields nothing, falls back to a looser bare-path pattern.
+      3. Reports whether the fallback was needed, so the caller can log/warn
+         instead of failing silently.
+
+    Returns (paths, used_fallback: bool). `paths` may still contain entries
+    that don't exist in the real repo tree — the caller (fetch_files_by_paths)
+    is responsible for validating against the real tree before fetching.
+    """
+    strict_matches = _BACKTICK_PATH_RE.findall(selector_brief)
+    if strict_matches:
+        seen = set()
+        ordered = []
+        for p in strict_matches:
+            if p not in seen:
+                seen.add(p)
+                ordered.append(p)
+        return ordered, False
+
+    fallback_matches = _BARE_PATH_RE.findall(selector_brief)
+    seen = set()
+    ordered = []
+    for p in fallback_matches:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    return ordered, bool(ordered)
+
+
 def parse_github_url(url):
     """Extract (owner, repo) from a github.com URL. Returns None if invalid."""
     match = re.search(r"github\.com/([^/\s]+)/([^/\s#?]+)", url.strip())
@@ -60,23 +104,43 @@ def parse_github_url(url):
     return owner, repo
 
 
-def get_default_branch(owner, repo):
-    resp = requests.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo}", timeout=10)
+def _auth_headers(token=None):
+    """Build request headers, adding an Authorization header if a token was supplied.
+    A token is entirely optional — the module still works unauthenticated — but
+    raises the core API rate limit from 60/hr to 5,000/hr when provided."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def get_default_branch(owner, repo, token=None):
+    resp = requests.get(
+        f"{GITHUB_API_BASE}/repos/{owner}/{repo}", headers=_auth_headers(token), timeout=10
+    )
     if resp.status_code == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
+        if token:
+            return None, (
+                "GitHub's authenticated rate limit (5,000 requests/hour) is exhausted "
+                "for now. It resets on a rolling hourly window — try again shortly."
+            )
         return None, (
             "GitHub's unauthenticated rate limit (60 requests/hour, shared across "
             "this network) is exhausted for now. It resets on a rolling hourly window — "
             "try again shortly, or add a free GitHub personal access token to raise this "
             "to 5,000/hour if you're hitting this often."
         )
+    if resp.status_code == 401:
+        return None, "GitHub token was rejected (401 Unauthorized). Check that it's valid and not expired."
     if resp.status_code != 200:
         return None, f"Repo lookup failed ({resp.status_code}). Is it public and spelled correctly?"
     return resp.json().get("default_branch", "main"), None
 
 
-def get_repo_tree(owner, repo, branch):
+def get_repo_tree(owner, repo, branch, token=None):
     resp = requests.get(
         f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1",
+        headers=_auth_headers(token),
         timeout=15,
     )
     if resp.status_code != 200:
@@ -166,21 +230,26 @@ def fetch_files_by_paths(owner, repo, branch, paths, tree_files, max_chars=1000,
     return snippets
 
 
-def fetch_raw_materials(repo_url):
+def fetch_raw_materials(repo_url, token=None):
     """
     Stage 1 (no LLM): fetch everything an LLM agent would need to reason about
     this repo. Returns (bundle_dict, error_message).
+
+    `token` is an optional GitHub personal access token. It is never required —
+    public repos work fine without it — but raises the core API rate limit
+    from 60/hr to 5,000/hr, which matters if this pipeline is run repeatedly
+    against the same repo in a session.
     """
     parsed = parse_github_url(repo_url)
     if not parsed:
         return None, "Couldn't parse a GitHub repo from that URL. Expected format: https://github.com/owner/repo"
     owner, repo = parsed
 
-    branch, err = get_default_branch(owner, repo)
+    branch, err = get_default_branch(owner, repo, token=token)
     if err:
         return None, err
 
-    tree_files, err = get_repo_tree(owner, repo, branch)
+    tree_files, err = get_repo_tree(owner, repo, branch, token=token)
     if err:
         return None, err
 
