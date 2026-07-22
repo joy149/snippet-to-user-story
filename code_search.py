@@ -1,28 +1,8 @@
-"""
-code_search.py — Semantic Code Search via Embedding Index
-
-Fetches all source files from a repo concurrently, chunks them by code
-boundaries, embeds via OpenAI text-embedding-3-small, and provides
-semantic search against arbitrary query text (typically the UI audit).
-
-Design constraints:
-  - Thread-safe, no Streamlit imports — safe to call from background threads.
-  - The OpenAI client is always passed explicitly (never imported from app.py)
-    so the module stays testable and decoupled.
-  - The caller (app.py) owns session-level caching of the CodeIndex object,
-    using the same main-thread-only st.session_state pattern as the existing
-    repo bundle cache.
-  - Brute-force cosine similarity via NumPy — no FAISS/pgvector needed at
-    repo scale (~2000 chunks, sub-millisecond search).
-
-Cost note:
-  text-embedding-3-small costs ~$0.02/M tokens.  A 300-file repo averaging
-  ~1500 tokens/file ≈ 450K tokens ≈ $0.009.  Cached per session.
-"""
-
+import os
+import json
 import re
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from concurrent.futures import ThreadPoolExecutor
 
 import github_context
@@ -41,37 +21,37 @@ SLIDING_WINDOW_CHARS = 1600     # ~400 tokens — fallback fixed-size window
 SLIDING_OVERLAP_CHARS = 400     # 25% overlap between adjacent windows
 
 MAX_FETCH_WORKERS = 15          # concurrent raw.githubusercontent.com fetches
-MAX_FETCH_CHARS = 6000          # per-file content cap for indexing
+MAX_FETCH_CHARS = 30000         # per-file content cap for indexing (~7500 tokens)
+DISK_CACHE_DIR = ".cache_code_index"
 
 
 # ---------------------------------------------------------------------------
 # Boundary detection patterns (per-language)
 # ---------------------------------------------------------------------------
 # Used to split files at meaningful code boundaries (function/class/component
-# definitions) before falling back to a dumb sliding window.
+# definitions) before falling back to a sliding window.
 
 _BOUNDARY_PATTERNS = [
-    # Python: class and function definitions (including async)
-    re.compile(r"^(?:async\s+)?(?:def|class)\s+\w+", re.MULTILINE),
+    # Python: class and function definitions (including decorated / async)
+    re.compile(r"^(?:@\w+(?:\(.*\))?\s*\n)*(?:async\s+)?(?:def|class)\s+\w+", re.MULTILINE),
     # JS/TS: function/class declarations, optionally exported
     re.compile(
-        r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function\s+\w+|class\s+\w+)",
+        r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function\s+\w*|class\s+\w+)",
         re.MULTILINE,
     ),
-    # JS/TS: const/let/var arrow-function or function-expression assignments
-    # (catches React component definitions like `const Panel3 = () => {`)
+    # JS/TS: top-level const/let/var component or function declarations
     re.compile(
-        r"^(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:\([^)]*\)\s*=>|function)",
+        r"^(?:export\s+)?(?:const|let|var)\s+\w+\s*(?::\s*[\w<>]+\s*)?=\s*(?:async\s*)?(?:\([^)]*\)|[\w]+)\s*=>",
         re.MULTILINE,
     ),
     # Go: func declarations
-    re.compile(r"^func\s+", re.MULTILINE),
+    re.compile(r"^func\s+(?:\([^)]+\)\s+)?\w+", re.MULTILINE),
     # Ruby: def/class/module
     re.compile(r"^(?:def|class|module)\s+\w+", re.MULTILINE),
-    # Java/Kotlin/C#: class/interface/enum declarations
+    # Java/Kotlin/C#: class/interface/enum/struct declarations
     re.compile(
         r"^\s*(?:public|private|protected|internal)?\s*"
-        r"(?:static\s+)?(?:abstract\s+)?(?:class|interface|enum|object)\s+\w+",
+        r"(?:static\s+)?(?:abstract\s+)?(?:final\s+)?(?:class|interface|enum|object|struct)\s+\w+",
         re.MULTILINE,
     ),
 ]
@@ -112,6 +92,60 @@ class CodeIndex:
     vectors: np.ndarray
     chunks: list           # list[ChunkMeta]
     file_contents: dict    # dict[str, str]
+
+
+# ---------------------------------------------------------------------------
+# Disk Caching
+# ---------------------------------------------------------------------------
+
+def _get_cache_path(owner, repo, branch, cache_dir=DISK_CACHE_DIR):
+    clean_key = f"{owner}_{repo}_{branch}".replace("/", "_").replace("\\", "_")
+    os.makedirs(cache_dir, exist_ok=True)
+    meta_path = os.path.join(cache_dir, f"{clean_key}.json")
+    vec_path = os.path.join(cache_dir, f"{clean_key}.npy")
+    return meta_path, vec_path
+
+
+def save_index_to_disk(index, owner, repo, branch, cache_dir=DISK_CACHE_DIR):
+    """Persist a CodeIndex to local disk to bypass re-embedding across restarts."""
+    if index is None or len(index.chunks) == 0:
+        return False
+    try:
+        meta_path, vec_path = _get_cache_path(owner, repo, branch, cache_dir)
+        np.save(vec_path, index.vectors)
+        
+        chunks_data = [asdict(c) for c in index.chunks]
+        payload = {
+            "chunks": chunks_data,
+            "file_contents": index.file_contents,
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return True
+    except Exception:
+        return False
+
+
+def load_index_from_disk(owner, repo, branch, cache_dir=DISK_CACHE_DIR):
+    """Load a cached CodeIndex from disk if available."""
+    try:
+        meta_path, vec_path = _get_cache_path(owner, repo, branch, cache_dir)
+        if not (os.path.exists(meta_path) and os.path.exists(vec_path)):
+            return None
+        
+        vectors = np.load(vec_path)
+        with open(meta_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        
+        chunks = [ChunkMeta(**c) for c in payload.get("chunks", [])]
+        file_contents = payload.get("file_contents", {})
+        
+        if len(vectors) != len(chunks):
+            return None
+            
+        return CodeIndex(vectors=vectors, chunks=chunks, file_contents=file_contents)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +214,6 @@ def chunk_file(file_path, content):
 
     if len(boundaries) >= 2:
         # ---- Boundary-based chunking ----
-        # Ensure we cover the file from line 0
         if boundaries[0] != 0:
             boundaries = [0] + boundaries
 
@@ -190,7 +223,6 @@ def chunk_file(file_path, content):
             chunk_text = "\n".join(lines[start_line:end_line])
 
             if len(chunk_text) > CHUNK_MAX_CHARS:
-                # Oversized boundary segment — sub-split with sliding window
                 sub_chunks = _sliding_window_chunks(chunk_text, start_line)
                 for sc in sub_chunks:
                     sc.file_path = file_path
@@ -203,9 +235,6 @@ def chunk_file(file_path, content):
                     text=chunk_text,
                 ))
             else:
-                # Tiny segment (e.g. a single import line before the first real
-                # boundary) — merge it into the next chunk if possible, or keep
-                # it if it's the only content.
                 if chunks:
                     prev = chunks[-1]
                     chunks[-1] = ChunkMeta(
@@ -214,7 +243,6 @@ def chunk_file(file_path, content):
                         start_line=prev.start_line,
                         text=prev.text + "\n" + chunk_text,
                     )
-                # else: will be picked up as part of the next boundary segment
 
     if not chunks:
         # ---- Fallback: sliding window over entire file ----
@@ -280,7 +308,6 @@ def _embed_texts(client, texts):
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[i : i + EMBED_BATCH_SIZE]
         response = client.embeddings.create(model=EMBED_MODEL, input=batch)
-        # response.data is ordered by index, but sort to be safe
         sorted_data = sorted(response.data, key=lambda d: d.index)
         all_embeddings.extend([item.embedding for item in sorted_data])
 
@@ -294,17 +321,7 @@ def _embed_texts(client, texts):
 def build_index(client, owner, repo, branch, paths):
     """
     Build a CodeIndex: fetch all files → chunk → embed.
-
-    Args:
-        client:  OpenAI client instance (for embeddings).
-        owner, repo, branch:  GitHub repo coordinates.
-        paths:   File paths to index (typically bundle["path_listing"]).
-
-    Returns (CodeIndex, error_message).
-        On success: (index, None).
-        On failure:  (None, "human-readable reason").
     """
-    # 1. Fetch all file contents concurrently
     try:
         file_contents = fetch_all_files(owner, repo, branch, paths)
     except Exception as e:
@@ -313,7 +330,6 @@ def build_index(client, owner, repo, branch, paths):
     if not file_contents:
         return None, "No file content could be fetched for indexing."
 
-    # 2. Chunk every file
     all_chunks = []
     for path in sorted(file_contents.keys()):
         file_chunks = chunk_file(path, file_contents[path])
@@ -322,61 +338,65 @@ def build_index(client, owner, repo, branch, paths):
     if not all_chunks:
         return None, "All fetched files produced zero usable chunks."
 
-    # 3. Embed all chunks
     try:
         chunk_texts = [c.text for c in all_chunks]
         vectors = _embed_texts(client, chunk_texts)
     except Exception as e:
         return None, f"Embedding API call failed: {e}"
 
-    return CodeIndex(
+    index = CodeIndex(
         vectors=vectors,
         chunks=all_chunks,
         file_contents=file_contents,
-    ), None
+    )
+    # Save to disk asynchronously/opportunistically
+    save_index_to_disk(index, owner, repo, branch)
+    return index, None
 
 
 # ---------------------------------------------------------------------------
-# Search
+# Search (Single and Multi-Query)
 # ---------------------------------------------------------------------------
 
-def search(client, index, query, top_k=15):
+def search_multi_queries(client, index, queries, top_k=15):
     """
-    Semantic search: find the files whose code content is most similar to
-    the query text (typically the UI audit output).
+    Multi-query semantic search: embeds multiple query strings (e.g. full UI audit +
+    per-feature node summaries) and performs max-similarity fusion across query vectors
+    to prevent visual audit query dilution.
 
-    Returns a list of SearchHit, deduplicated to one per file (highest
-    scoring chunk wins), sorted by descending similarity, up to top_k files.
+    Returns deduplicated SearchHit list sorted by descending similarity score.
     """
     if index is None or len(index.chunks) == 0:
         return []
 
-    # Embed the query
-    try:
-        query_vec = _embed_texts(client, [query])[0]
-    except Exception:
-        return []   # graceful degradation — no semantic hits this run
+    valid_queries = [q.strip() for q in queries if q and q.strip()]
+    if not valid_queries:
+        return []
 
-    # Cosine similarity — OpenAI embeddings are pre-normalized, but normalize
-    # defensively in case of numerical drift or future model changes.
+    try:
+        query_vecs = _embed_texts(client, valid_queries)
+    except Exception:
+        return []
+
     norms = np.linalg.norm(index.vectors, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
     normalized_vecs = index.vectors / norms
 
-    query_norm = np.linalg.norm(query_vec)
-    if query_norm > 0:
-        query_vec = query_vec / query_norm
+    q_norms = np.linalg.norm(query_vecs, axis=1, keepdims=True)
+    q_norms = np.where(q_norms == 0, 1.0, q_norms)
+    normalized_q_vecs = query_vecs / q_norms
 
-    similarities = normalized_vecs @ query_vec          # shape (N,)
+    # Shape: (N_chunks, Q_queries)
+    sim_matrix = normalized_vecs @ normalized_q_vecs.T
+    chunk_scores = np.max(sim_matrix, axis=1)
 
-    # Rank and deduplicate by file path (keep best chunk per file)
-    top_indices = np.argsort(similarities)[::-1]
+    top_indices = np.argsort(chunk_scores)[::-1]
 
     seen_files = {}
     for idx in top_indices:
         idx = int(idx)
         chunk = index.chunks[idx]
-        score = float(similarities[idx])
+        score = float(chunk_scores[idx])
         if chunk.file_path not in seen_files:
             seen_files[chunk.file_path] = SearchHit(
                 file_path=chunk.file_path,
@@ -390,6 +410,11 @@ def search(client, index, query, top_k=15):
     return sorted(seen_files.values(), key=lambda h: h.score, reverse=True)
 
 
+def search(client, index, query, top_k=15):
+    """Convenience wrapper for single query semantic search."""
+    return search_multi_queries(client, index, [query], top_k=top_k)
+
+
 # ---------------------------------------------------------------------------
 # Prompt formatting
 # ---------------------------------------------------------------------------
@@ -398,9 +423,6 @@ def format_hits_for_prompt(hits, max_hits=10):
     """
     Format search hits as a markdown table suitable for injection into the
     file-selector LLM prompt (Pass 1).
-
-    Returns an empty string if there are no hits — callers can use truthiness
-    to decide whether to include the section.
     """
     if not hits:
         return ""
@@ -414,7 +436,6 @@ def format_hits_for_prompt(hits, max_hits=10):
     ]
 
     for i, hit in enumerate(hits[:max_hits], 1):
-        # Sanitize the preview for safe table embedding
         preview = hit.chunk_text.replace("\n", " ").replace("|", "\\|")
         if len(preview) > 120:
             preview = preview[:120]
@@ -423,3 +444,4 @@ def format_hits_for_prompt(hits, max_hits=10):
         )
 
     return "\n".join(lines)
+

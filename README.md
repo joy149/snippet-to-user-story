@@ -2,9 +2,8 @@
 
 Turns uploaded UI screenshots/mocks (including reviewer markup like circled
 annotations or red-ink change requests) into structured, developer-ready user
-stories — optionally grounded against a real GitHub repository so the
-generated tasks reference actual file paths, dependencies, and coding
-conventions instead of generic scaffolding.
+stories — grounded against a real GitHub repository so the generated tasks
+reference actual file paths, dependencies, and coding conventions instead of generic scaffolding.
 
 ## How it works
 
@@ -15,18 +14,18 @@ A multi-agent pipeline (via the OpenAI API) processes each run:
    rendered state from any reviewer-added annotations/markup.
 2. **Decomposition Architect** (`skills_agent2.md`) — partitions that
    inventory into independent, MECE feature nodes.
-3. **Repo Context Enrichment** *(optional)* — if a GitHub repo URL is
-   provided:
-   - fetches the repo's file tree and manifest/dependency info
-     (`github_context.py`, no LLM calls),
-   - a **File & Dependency Selector** (`skills_repo_synth.md`) picks which
-     real files are worth reading,
-   - an **Architecture & Pattern Synthesizer** (`skills_repo_architecture.md`)
-     reads that real code and detects actual conventions to follow.
-4. **Agile Writer** (`skills_agent3.md`) — compiles final developer epics
-   (one call per feature node), including a dedicated epic for any
-   reviewer-requested change, grounded in the repo context above when
-   available.
+3. **Repo Context Enrichment (RAG Grounding)** *(optional)* — if a GitHub repo URL is provided:
+   - **Tree & Dependency Fetch**: Fetches repo structure and dependency manifests (`github_context.py`, no LLM calls).
+   - **Semantic Code Search**: Chunking (`CHUNK_MAX_CHARS=2400`) and batch embeddings (`text-embedding-3-small`) with **multi-query max-similarity fusion** to surface semantically related code (`code_search.py`).
+   - **Import Graph Resolution**: Automatically traces local JS/TS/Python relative imports from selected files to pull in dependent helper/service files.
+   - **Pass 1 - File Selector** (`skills_repo_synth.md`): Evaluates route matches, dependencies, semantic search hits, and tree paths to pick target files.
+   - **Pass 2 - Architecture Synthesizer** (`skills_repo_architecture.md`): Reads actual code content, verifies Pass 1 verdicts, and extracts exact symbols, state patterns, and conventions.
+4. **Agile Writer (Gap Analysis & Delta Engine)** (`skills_agent3.md`) — compiles final developer epics:
+   - **Repo Context Available**: Performs a Gap Analysis against the codebase:
+     - *Already Implemented*: Emits a 1-line `✅ Already Implemented` status banner (skipping redundant task lists).
+     - *Existing + Reviewer Markup*: Emits a `🔧 DELTA / MODIFICATION EPIC` with tasks ONLY for the code diff targeting existing files.
+     - *Net-New*: Emits a `🆕 NET-NEW DEVELOPER EPIC` with creation tasks grounded in detected repo conventions.
+   - **No Repo Context**: Treats all features as 100% scratch development.
 
 Agent 2's output and the repo-grounding pipeline are independent of each
 other (both only depend on Agent 1's output), so they run **in parallel** to
@@ -51,9 +50,9 @@ In the sidebar, optionally provide:
   Useful if you're re-running the pipeline against the same repo
   repeatedly in one session. Never stored beyond the browser session.
 
-Repo trees are cached per-session per-URL, so re-running the pipeline
-against the same repo (e.g. after tweaking a screenshot) doesn't re-spend
-an API call on re-fetching the tree.
+### Performance & Caching
+- **Repo Trees**: Cached per-session per-URL to save GitHub REST API calls.
+- **Embedding Index**: Saved to local disk cache (`.cache_code_index/`), reducing re-run indexing latency to **~0 ms** and spending zero OpenAI embedding API calls on repeated runs.
 
 ## Collapse mode
 
@@ -66,9 +65,10 @@ more complex, multi-screen flows, leave it off to run the full pipeline.
 | File | Purpose |
 | --- | --- |
 | `app.py` | Streamlit UI + pipeline orchestration |
-| `github_context.py` | GitHub API access (tree fetch, file fetch, dependency parsing) — no LLM calls |
+| `github_context.py` | GitHub API access (tree fetch, file fetch, dependency parsing, import graph resolution) — no LLM calls |
+| `code_search.py` | Dense vector embedding index (`text-embedding-3-small`), AST boundary chunking, multi-query search fusion, and disk persistence |
 | `pipeline_utils.py` | Pure helper logic (e.g. splitting a blueprint into feature nodes), kept Streamlit-free so it's directly testable |
-| `skills_agent1.md` / `skills_agent2.md` / `skills_agent3.md` | System prompts for the three main pipeline agents |
+| `skills_agent1.md` / `skills_agent2.md` / `skills_agent3.md` | System prompts for the main pipeline agents (`agent3` acts as Gap Analysis Delta Engine) |
 | `skills_repo_synth.md` / `skills_repo_architecture.md` | System prompts for the two-pass repo grounding agents |
 
 ## Running tests
@@ -78,12 +78,11 @@ pip install -r requirements.txt
 pytest -v
 ```
 
-The test suite (`test_github_context.py`, `test_pipeline_utils.py`) covers
-the pure, deterministic logic — URL parsing, path filtering, dependency
-parsing, the feature-node splitter and its schema-deviation fallback — with
+The test suite (`test_github_context.py`, `test_code_search.py`, `test_pipeline_utils.py`) covers
+all deterministic logic — URL parsing, path filtering, dependency parsing, AST boundary chunking, multi-query search fusion, import graph resolution, and disk caching — with
 no network calls, so it runs in well under a second. `app.py` itself isn't
 imported by the tests since it builds Streamlit UI at import time; its
-testable logic lives in `pipeline_utils.py` for exactly this reason.
+testable logic lives in standalone modules for exactly this reason.
 
 CI (`.github/workflows/test.yml`) runs the suite automatically on every push
 and pull request against Python 3.10–3.12.

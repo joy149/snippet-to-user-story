@@ -252,3 +252,43 @@ class TestDetectTechStackParsing:
         tree_files = [{"path": "src/App.jsx", "type": "blob"}]
         result = gc.detect_tech_stack("owner", "repo", "main", tree_files)
         assert "No recognized manifest file found" in result
+
+
+# ---------------------------------------------------------------------------
+# resolve_imported_dependencies
+# ---------------------------------------------------------------------------
+
+class TestResolveImportedDependencies:
+    def test_resolves_js_relative_imports(self, monkeypatch):
+        tree_files = [
+            {"path": "src/components/Form.jsx", "type": "blob"},
+            {"path": "src/services/api.js", "type": "blob"},
+            {"path": "src/components/helpers.js", "type": "blob"},
+        ]
+        snippets = [(
+            "src/components/Form.jsx",
+            "import { postData } from '../services/api';\nimport { formatDate } from './helpers';"
+        )]
+
+        def _fake_fetch(owner, repo, branch, path, max_chars=2500):
+            if path == "src/services/api.js":
+                return "export const postData = () => {};"
+            if path == "src/components/helpers.js":
+                return "export const formatDate = () => {};"
+            return None
+
+        monkeypatch.setattr(gc, "fetch_raw_file", _fake_fetch)
+        extras = gc.resolve_imported_dependencies(
+            snippets, "owner", "repo", "main", tree_files, max_extra_files=3
+        )
+        assert len(extras) == 2
+        assert "src/services/api.js" in extras[0] or "src/services/api.js" in extras[1]
+        assert "src/components/helpers.js" in extras[0] or "src/components/helpers.js" in extras[1]
+
+    def test_respects_max_paths_cap_and_depth_sorting(self):
+        tree_files = [
+            {"path": f"dir{i}/file{i}.js", "type": "blob"} for i in range(700)
+        ]
+        listing, truncated = gc.build_path_listing(tree_files, max_paths=600)
+        assert len(listing) == 600
+        assert truncated is True

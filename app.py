@@ -124,8 +124,11 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output,
 
     cache_note = " _(reused from an earlier fetch this session)_" if from_cache else ""
 
-    # --- Semantic code search: build or reuse the embedding index ---
+    # --- Semantic code search: build, load from disk, or reuse session embedding index ---
     code_index = cached_code_index
+    if code_index is None and bundle:
+        code_index = code_search.load_index_from_disk(bundle["owner"], bundle["repo"], bundle["branch"])
+
     code_index_to_cache = None
     semantic_hits_block = ""
     index_warning = None
@@ -142,7 +145,13 @@ def run_repo_grounding_pipeline(github_repo_url, github_token, agent_1_output,
             code_index_to_cache = code_index    # caller caches on main thread
 
     if code_index is not None:
-        hits = code_search.search(client, code_index, agent_1_output, top_k=15)
+        # Multi-query fusion: embed full audit + distinct UI sections to prevent query dilution
+        queries = [agent_1_output]
+        sub_queries = [section.strip() for section in agent_1_output.split("\n\n") if len(section.strip()) > 30]
+        if sub_queries:
+            queries.extend(sub_queries[:5])
+
+        hits = code_search.search_multi_queries(client, code_index, queries, top_k=15)
         semantic_hits_block = code_search.format_hits_for_prompt(hits, max_hits=10)
 
     # --- Build the file-selector prompt ---
@@ -506,12 +515,18 @@ with col2:
                             f"{repo_context_block}"
                         ),
                     }]
-                    # Each call only ever covers ONE feature node, so output size is bounded
-                    # regardless of total screenshot/annotation count — no truncation risk.
                     result = call_openai(MODEL_TEXT, skill_3, user_content, max_tokens=3000)
                     if result is None:
                         st.stop()
-                    story_sections.append(result)
+                    # Strip any accidental ```markdown wrapper added by the model so Streamlit renders a rich preview
+                    clean_res = result.strip()
+                    if clean_res.startswith("```markdown"):
+                        clean_res = clean_res[11:]
+                    elif clean_res.startswith("```"):
+                        clean_res = clean_res[3:]
+                    if clean_res.endswith("```"):
+                        clean_res = clean_res[:-3]
+                    story_sections.append(clean_res.strip())
 
                 st.session_state.agent_3_output = "\n\n".join(story_sections)
                 status.update(label="✍️ Engineering Stories Compiled", state="complete")
