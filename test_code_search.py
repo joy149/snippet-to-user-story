@@ -384,3 +384,47 @@ class TestEdgeCases:
         finally:
             cs._embed_texts = cs._embed_texts_backup
             del cs._embed_texts_backup
+
+
+# ---------------------------------------------------------------------------
+# Multi-Query Search & Disk Cache
+# ---------------------------------------------------------------------------
+
+class TestMultiQueryAndDiskCache:
+    def test_search_multi_queries_max_fusion(self):
+        index = cs.CodeIndex(
+            vectors=np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+            chunks=[
+                cs.ChunkMeta("feat_a.py", 0, 1, "code a"),
+                cs.ChunkMeta("feat_b.py", 1, 1, "code b"),
+            ],
+            file_contents={"feat_a.py": "code a", "feat_b.py": "code b"},
+        )
+        # Mock _embed_texts to return two query vectors: [1, 0, 0] and [0, 1, 0]
+        original_embed = cs._embed_texts
+        cs._embed_texts = lambda client, texts: np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        try:
+            hits = cs.search_multi_queries(None, index, ["query a", "query b"])
+            assert len(hits) == 2
+            # Both should have score ~ 1.0 due to max-fusion
+            assert hits[0].score >= 0.99
+            assert hits[1].score >= 0.99
+        finally:
+            cs._embed_texts = original_embed
+
+    def test_disk_cache_save_and_load(self, tmp_path):
+        cache_dir = str(tmp_path / ".cache_test")
+        index = cs.CodeIndex(
+            vectors=np.array([[0.1, 0.2, 0.3]], dtype=np.float32),
+            chunks=[cs.ChunkMeta("test.py", 0, 1, "content")],
+            file_contents={"test.py": "content"},
+        )
+        ok = cs.save_index_to_disk(index, "test_owner", "test_repo", "main", cache_dir=cache_dir)
+        assert ok is True
+
+        loaded = cs.load_index_from_disk("test_owner", "test_repo", "main", cache_dir=cache_dir)
+        assert loaded is not None
+        assert len(loaded.chunks) == 1
+        assert loaded.chunks[0].file_path == "test.py"
+        assert loaded.file_contents.get("test.py") == "content"
+

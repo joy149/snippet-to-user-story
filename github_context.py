@@ -190,17 +190,79 @@ def detect_tech_stack(owner, repo, branch, tree_files):
     return "\n".join(findings) if findings else "No recognized manifest file found near repo root."
 
 
+import os
+
+_JS_TS_IMPORT_RE = re.compile(r"""(?:import|export)\s+(?:[\w\s{},*]+from\s+)?['"](\.[^'"]+)['"]|require\(['"](\.[^'"]+)['"]\)""")
+_PY_IMPORT_RE = re.compile(r"""from\s+(\.[^\s]+)\s+import|import\s+(\.[^\s]+)""")
+
+
+def resolve_imported_dependencies(snippets_fetched, owner, repo, branch, tree_files, max_extra_files=3, max_chars=2500):
+    """
+    Parse relative imports inside already-fetched code snippets, resolve them against tree_files,
+    and fetch content for those imported dependency files so Pass 2 has graph awareness.
+    `snippets_fetched` is a list of (path, content) tuples.
+    """
+    valid_paths = {f["path"] for f in tree_files}
+    already_fetched = {p for p, _ in snippets_fetched}
+    extra_snippets = []
+
+    for path, content in snippets_fetched:
+        if len(extra_snippets) >= max_extra_files:
+            break
+        if not content:
+            continue
+
+        dir_name = os.path.dirname(path)
+        raw_imports = []
+
+        # JS/TS relative imports
+        for m in _JS_TS_IMPORT_RE.finditer(content):
+            rel = m.group(1) or m.group(2)
+            if rel:
+                raw_imports.append(rel)
+
+        # Python relative imports
+        for m in _PY_IMPORT_RE.finditer(content):
+            rel = m.group(1) or m.group(2)
+            if rel:
+                raw_imports.append(rel.replace(".", "/"))
+
+        for rel in raw_imports:
+            if len(extra_snippets) >= max_extra_files:
+                break
+
+            norm_target = os.path.normpath(os.path.join(dir_name, rel)).replace("\\", "/")
+            candidates = [norm_target]
+            if not os.path.splitext(norm_target)[1]:
+                candidates.extend([
+                    f"{norm_target}.ts", f"{norm_target}.tsx", f"{norm_target}.js", f"{norm_target}.jsx",
+                    f"{norm_target}/index.ts", f"{norm_target}/index.tsx", f"{norm_target}/index.js",
+                    f"{norm_target}.py"
+                ])
+
+            for cand in candidates:
+                if cand in valid_paths and cand not in already_fetched:
+                    extra_content = fetch_raw_file(owner, repo, branch, cand, max_chars=max_chars)
+                    if extra_content:
+                        already_fetched.add(cand)
+                        extra_snippets.append(
+                            f"**`{cand}`** *(automatically included import dependency of `{path}`)*\n```\n{extra_content}\n```"
+                        )
+                    break
+
+    return extra_snippets
+
+
 def get_top_level_structure(tree_files, max_entries=25):
     top_level = sorted({f["path"].split("/")[0] for f in tree_files if not _is_excluded(f["path"])})
     return ", ".join(top_level[:max_entries])
 
 
-def build_path_listing(tree_files, max_paths=350):
+def build_path_listing(tree_files, max_paths=600):
     """
     A filtered, capped listing of source file paths for an LLM agent to read and
     reason over (which files are architecturally relevant to a given feature).
-    Sorted shortest-path-first so root/architecturally-central files surface first
-    when the list has to be truncated.
+    Depth-balanced sorting so deeply nested feature components aren't excluded.
     """
     candidates = [
         f["path"] for f in tree_files
@@ -208,18 +270,20 @@ def build_path_listing(tree_files, max_paths=350):
         and ("." + f["path"].split(".")[-1] if "." in f["path"] else "") in RELEVANT_EXTENSIONS
         and f.get("size", 0) <= 60000
     ]
-    candidates.sort(key=len)
+    # Balanced sort by directory depth first, then length
+    candidates.sort(key=lambda p: (p.count("/"), len(p)))
     truncated = len(candidates) > max_paths
     return candidates[:max_paths], truncated
 
 
-def fetch_files_by_paths(owner, repo, branch, paths, tree_files, max_chars=1000, max_files=10):
+def fetch_files_by_paths(owner, repo, branch, paths, tree_files, max_chars=2500, max_files=12, resolve_imports=True):
     """
     Fetch content for a list of paths an LLM agent selected — but only paths that
-    actually exist in the real tree (prevents fetching/trusting a hallucinated path).
+    actually exist in the real tree. Automatically resolves imported dependencies if enabled.
     """
     valid_paths = {f["path"] for f in tree_files}
     snippets = []
+    fetched_records = []
     for path in paths[:max_files]:
         path = path.strip().strip("`")
         if path not in valid_paths:
@@ -227,6 +291,14 @@ def fetch_files_by_paths(owner, repo, branch, paths, tree_files, max_chars=1000,
         content = fetch_raw_file(owner, repo, branch, path, max_chars=max_chars)
         if content:
             snippets.append(f"**`{path}`**\n```\n{content}\n```")
+            fetched_records.append((path, content))
+
+    if resolve_imports and fetched_records:
+        extra_snippets = resolve_imported_dependencies(
+            fetched_records, owner, repo, branch, tree_files, max_extra_files=3, max_chars=max_chars
+        )
+        snippets.extend(extra_snippets)
+
     return snippets
 
 
@@ -234,11 +306,6 @@ def fetch_raw_materials(repo_url, token=None):
     """
     Stage 1 (no LLM): fetch everything an LLM agent would need to reason about
     this repo. Returns (bundle_dict, error_message).
-
-    `token` is an optional GitHub personal access token. It is never required —
-    public repos work fine without it — but raises the core API rate limit
-    from 60/hr to 5,000/hr, which matters if this pipeline is run repeatedly
-    against the same repo in a session.
     """
     parsed = parse_github_url(repo_url)
     if not parsed:
